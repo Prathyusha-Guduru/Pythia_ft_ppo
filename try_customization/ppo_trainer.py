@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+NUM_PPO_EPOCHS = 1000
+
 import gc
 import math
 import os
@@ -46,7 +48,7 @@ from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
 from transformers.trainer_callback import CallbackHandler, ExportableState, PrinterCallback
 from transformers.utils import is_peft_available
 
-from ..core import masked_mean, masked_whiten
+from ..core import masked_mean, masked_whiten, masked_var
 from ..models import create_reference_model
 from ..models.utils import unwrap_model_for_generation
 from .ppo_config import PPOConfig
@@ -78,6 +80,12 @@ if is_wandb_available():
 
 
 INVALID_LOGPROB = 1.0
+
+import os
+os.environ["TMPDIR"] = "/scratch/cluster/piti/tmp"  
+
+# import tempfile
+# print(tempfile.gettempdir())  
 
 
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
@@ -144,6 +152,10 @@ class PPOTrainer(Trainer):
         self.args = args
         self.processing_class = processing_class
         self.policy_model = model
+        
+        print("----"* 20)
+        print(f"Using {args.num_ppo_epochs} PPO epochs for training.")
+        print("----"* 20)
 
         for param in self.policy_model.parameters():
             param.requires_grad = False
@@ -202,7 +214,7 @@ class PPOTrainer(Trainer):
         self.eval_dataset = eval_dataset
         # Use a constant learning rate scheduler
         value_params = [p for p in self.value_model.parameters() if p.requires_grad]
-        optimizer = torch.optim.Adam(value_params, lr=3e-6)
+        optimizer = torch.optim.Adam(value_params, lr=5e-5)
 
         self.optimizer = optimizer
 
@@ -434,6 +446,11 @@ class PPOTrainer(Trainer):
         vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
         entropy_stats = torch.zeros(stats_shape, device=device)
         ratio_stats = torch.zeros(stats_shape, device=device)
+        td_error_stats = torch.zeros(stats_shape, device=device)
+        target_value_stats = torch.zeros(stats_shape, device=device)
+        pred_value_stats = torch.zeros(stats_shape, device=device)
+        return_stats = torch.zeros(stats_shape, device=device)
+
         model.train()
 
         # trainer state initialization
@@ -579,21 +596,25 @@ class PPOTrainer(Trainer):
                 # 6. compute advantages and returns
                 lastgaelam = 0
                 advantages_reversed = []
+                td_errors_reversed = []
                 gen_length = responses.shape[1]
                 for t in reversed(range(gen_length)):
                     nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
                     delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
+                    td_errors_reversed.append(delta)
                     lastgaelam = delta + args.gamma * args.lam * lastgaelam
+                    # print("GAMMA", args.gamma, "LAM", args.lam) # Gamma = 1.0, Lam = 0.95
                     advantages_reversed.append(lastgaelam)
                 advantages = torch.stack(advantages_reversed[::-1], axis=1)
                 returns = advantages + values
                 advantages = masked_whiten(advantages, ~padding_mask)
                 advantages = torch.masked_fill(advantages, padding_mask, 0)
+                td_errors = torch.stack(td_errors_reversed[::-1], axis=1)  # [batch_size, seq_len]
                 torch.cuda.empty_cache()
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
             unwrapped_model = accelerator.unwrap_model(model)
-            before_policy = get_param_sum(unwrapped_model.policy)
+            # before_policy = get_param_sum(unwrapped_model.policy)
             before_value = get_param_sum(unwrapped_model.value_model)
 
             for ppo_epoch_idx in range(args.num_ppo_epochs):
@@ -623,6 +644,7 @@ class PPOTrainer(Trainer):
                             )
                             vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
                             vpred = torch.masked_fill(vpred, padding_mask_p1[micro_batch_inds], 0)
+                            # print(args.cliprange_value) # CLIP RANGE value 0.2
                             vpredclipped = torch.clamp(
                                 vpred,
                                 mb_values - args.cliprange_value,
@@ -649,15 +671,16 @@ class PPOTrainer(Trainer):
                             optimizer.step() # update parameters with gradients
                             optimizer.zero_grad() # reset gradients to zero
 
-                            after_policy = get_param_sum(unwrapped_model.policy)
+                            # after_policy = get_param_sum(unwrapped_model.policy)
                             after_value = get_param_sum(unwrapped_model.value_model)
 
-                            if before_policy != None and after_policy is not None:
-                                accelerator.print(
-                                    f"\n\n----------------------------------------------"
-                                    f"Policy params sum: {before_policy} -> {after_policy} "
-                                    f"({after_policy - before_policy})"
-                                )
+                            # To confirm policy function is not changing and value function is changing
+                            # if before_policy != None and after_policy is not None:
+                            #     accelerator.print(
+                            #         f"\n\n----------------------------------------------"
+                            #         f"Policy params sum: {before_policy} -> {after_policy} "
+                            #         f"({after_policy - before_policy})"
+                            #     )
                             if before_value != None and after_value is not None:
                                 accelerator.print(
                                     f"\n\n----------------------------------------------"
@@ -672,6 +695,11 @@ class PPOTrainer(Trainer):
                                 prob_dist = torch.nn.functional.softmax(logits, dim=-1)
                                 entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
                                 approxkl = 0.5 * (logprobs_diff**2).mean()
+                                mb_td_errors = td_errors[micro_batch_inds]
+                                td_error_masked = masked_mean(torch.abs(mb_td_errors), ~padding_mask[micro_batch_inds])
+                                target_value_masked = masked_mean(mb_return, ~padding_mask_p1[micro_batch_inds])
+                                pred_value_masked = masked_mean(vpred, ~padding_mask_p1[micro_batch_inds])
+                                return_masked = masked_mean(mb_return, ~padding_mask_p1[micro_batch_inds])
                                 approxkl_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
                                 pg_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
                                     pg_clipfrac
@@ -683,6 +711,13 @@ class PPOTrainer(Trainer):
                                 )
                                 entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
                                 ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
+
+                                td_error_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = td_error_masked
+                                target_value_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = target_value_masked
+                                pred_value_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pred_value_masked
+                                return_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = return_masked
+
+                                
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
                     # del everything and empty cache
@@ -701,6 +736,18 @@ class PPOTrainer(Trainer):
                 mean_non_score_reward = non_score_reward.sum(1).mean()
                 rlhf_reward = mean_non_score_reward + scores.mean()
                 eps = int(self.state.episode / (time.time() - start_time))
+                episode_td_error_mean = masked_mean(torch.abs(td_errors), ~padding_mask).item()
+                # episode_td_error_std = masked_var(td_errors, ~padding_mask).item()
+                episode_returns_mean = masked_mean(returns, ~padding_mask_p1).item()
+                # episode_returns_std = masked_var(returns, ~padding_mask_p1).item()
+                episode_values_mean = masked_mean(values, ~padding_mask_p1).item()
+                # episode_values_std = masked_var(values, ~padding_mask_p1).item()
+
+                episode_td_error_std = np.sqrt(masked_var(td_errors, ~padding_mask).item())
+                episode_returns_std = np.sqrt(masked_var(returns, ~padding_mask_p1).item())
+                episode_values_std = np.sqrt(masked_var(values, ~padding_mask_p1).item())
+
+
                 metrics = {}
                 metrics["eps"] = eps
                 metrics["objective/kl"] = self.accelerator.gather_for_metrics(mean_kl).mean().item()
@@ -721,6 +768,50 @@ class PPOTrainer(Trainer):
                 metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
+
+                metrics["val/td_error_episode_mean"] = episode_td_error_mean
+                metrics["val/td_error_episode_std"] = episode_td_error_std
+                metrics["val/td_error_training_avg"] = self.accelerator.gather_for_metrics(td_error_stats).mean().item()
+                metrics["val/td_error_training_std"] = self.accelerator.gather_for_metrics(td_error_stats).std().item()
+                metrics["val/target_value_avg"] = self.accelerator.gather_for_metrics(target_value_stats).mean().item()
+                metrics["val/target_value_std"] = self.accelerator.gather_for_metrics(target_value_stats).std().item()
+                metrics["val/pred_value_avg"] = self.accelerator.gather_for_metrics(pred_value_stats).mean().item()
+                metrics["val/pred_value_std"] = self.accelerator.gather_for_metrics(pred_value_stats).std().item()
+                metrics["val/return_avg"] = self.accelerator.gather_for_metrics(return_stats).mean().item()
+                metrics["val/return_std"] = self.accelerator.gather_for_metrics(return_stats).std().item()
+                
+                # Episode-level value and return stats
+                metrics["val/returns_episode_mean"] = episode_returns_mean
+                metrics["val/returns_episode_std"] = episode_returns_std
+                metrics["val/values_episode_mean"] = episode_values_mean
+                metrics["val/values_episode_std"] = episode_values_std
+
+                if update % 10 == 0 or update == args.num_total_batches:
+                    # Flatten arrays
+                    td_errors_flat = td_errors[~padding_mask].cpu().numpy()
+                    returns_flat = returns[~padding_mask_p1].cpu().numpy()
+                    values_flat = values[~padding_mask_p1].cpu().to(torch.float32).numpy()
+                    advantages_flat = advantages[~padding_mask].cpu().numpy()
+                    rewards_flat = rewards[~padding_mask_p1].cpu().numpy()
+
+                    td_error_training_flat = self.accelerator.gather_for_metrics(td_error_stats).flatten().cpu().numpy()
+                    target_value_training_flat = self.accelerator.gather_for_metrics(target_value_stats).flatten().cpu().numpy()
+                    pred_value_training_flat = self.accelerator.gather_for_metrics(pred_value_stats).flatten().cpu().numpy()
+
+                    if self.accelerator.is_main_process and "wandb" in args.report_to:
+                        if wandb.run is not None:
+                            wandb.log({
+                                "hist/td_errors_episode": wandb.Histogram(td_errors_flat),
+                                "hist/returns_episode": wandb.Histogram(returns_flat),
+                                "hist/values_episode": wandb.Histogram(values_flat),
+                                "hist/advantages_episode": wandb.Histogram(advantages_flat),
+                                "hist/rewards_episode": wandb.Histogram(rewards_flat),
+                                "hist/td_errors_training": wandb.Histogram(td_error_training_flat),
+                                "hist/target_values_training": wandb.Histogram(target_value_training_flat),
+                                "hist/pred_values_training": wandb.Histogram(pred_value_training_flat),
+                            }, step=self.state.global_step)
+
+
                 self.state.epoch = self.state.episode / self.train_dataset_len  # used by self.log
                 self.state.global_step += 1
                 self.log(metrics)
@@ -812,14 +903,15 @@ class PPOTrainer(Trainer):
                 if sampling:
                     break
         df = pd.DataFrame(table)
+        df.to_csv(os.path.join(self.args.output_dir, "completions.csv"), index=False)
 
         if self.accelerator.is_main_process:
             print_rich_table(df.iloc[0 : 0 + 5])
-            if "wandb" in args.report_to:
-                import wandb
+            # if "wandb" in args.report_to:
+            #     import wandb
 
-                if wandb.run is not None:
-                    wandb.log({"completions": wandb.Table(dataframe=df)})
+            #     if wandb.run is not None:
+            #         wandb.log({"completions": wandb.Table(dataframe=df)})
 
             if "comet_ml" in args.report_to:
                 log_table_to_comet_experiment(
