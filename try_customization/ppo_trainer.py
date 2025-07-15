@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-NUM_PPO_EPOCHS = 1000
+NUM_PPO_EPOCHS = 10
 
 import gc
 import math
@@ -86,6 +86,26 @@ os.environ["TMPDIR"] = "/scratch/cluster/piti/tmp"
 
 # import tempfile
 # print(tempfile.gettempdir())  
+
+def fast_nan_guard(tensor: torch.Tensor, name: str, accelerator, verbose=False, abort=False):
+    if not torch.is_tensor(tensor):
+        return
+    if not torch.isfinite(tensor).all():
+        accelerator.print(f"[Rank {accelerator.process_index}] ❌ NaN or Inf in {name}")
+        if verbose:
+            accelerator.print(f"{name} stats: min={tensor.min()}, max={tensor.max()}, mean={tensor.mean()}")
+        if abort:
+            raise ValueError(f"NaN/Inf in {name}")
+
+def nan_guard(tensor: torch.Tensor, name: str, accelerator, rank=None, abort=True):
+    if not torch.is_tensor(tensor):
+        return
+    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+        rank = rank if rank is not None else accelerator.process_index
+        accelerator.print(f"[Rank {rank}] ❌ NaN or Inf detected in `{name}`")
+        accelerator.print(f"[{name}] min={tensor.min()}, max={tensor.max()}, mean={tensor.mean()}")
+        if abort:
+            raise ValueError(f"NaN/Inf detected in `{name}` on rank {rank}")
 
 
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
@@ -214,7 +234,10 @@ class PPOTrainer(Trainer):
         self.eval_dataset = eval_dataset
         # Use a constant learning rate scheduler
         value_params = [p for p in self.value_model.parameters() if p.requires_grad]
-        optimizer = torch.optim.Adam(value_params, lr=5e-5)
+        LR = 0.0005
+        print("Training learning rate for this training is: ", LR)
+        optimizer = torch.optim.Adam(value_params, lr=LR)
+        
 
         self.optimizer = optimizer
 
@@ -224,6 +247,8 @@ class PPOTrainer(Trainer):
         else:
             self.lr_scheduler = None
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
+
+        # print("learning rate is ", )
 
         #########
         # calculate various batch sizes
@@ -450,6 +475,7 @@ class PPOTrainer(Trainer):
         target_value_stats = torch.zeros(stats_shape, device=device)
         pred_value_stats = torch.zeros(stats_shape, device=device)
         return_stats = torch.zeros(stats_shape, device=device)
+        vf_clipfrac_hits_ratio = torch.zeros(stats_shape, device=device)
 
         model.train()
 
@@ -650,6 +676,10 @@ class PPOTrainer(Trainer):
                                 mb_values - args.cliprange_value,
                                 mb_values + args.cliprange_value,
                             )
+                            clipped_mask = (vpred != vpredclipped).float()
+                            numerator = torch.sum(clipped_mask[~padding_mask_p1[micro_batch_inds]])
+                            denominator = torch.sum((~padding_mask_p1[micro_batch_inds]).float())
+                            value_clipfrac = numerator / (denominator + 1e-8)
                             vf_losses1 = torch.square(vpred - mb_return)
                             vf_losses2 = torch.square(vpredclipped - mb_return)
                             vf_loss_max = torch.max(vf_losses1, vf_losses2)
@@ -664,12 +694,54 @@ class PPOTrainer(Trainer):
                             pg_loss_max = torch.max(pg_losses, pg_losses2)
                             pg_loss = masked_mean(pg_loss_max, ~padding_mask[micro_batch_inds])
                             # loss = pg_loss + args.vf_coef * vf_loss
-                            loss = vf_loss
+                            loss = vf_loss* args.vf_coef 
 
-                           
-                            accelerator.backward(loss) # compute gradients
-                            optimizer.step() # update parameters with gradients
-                            optimizer.zero_grad() # reset gradients to zero
+
+                            # if not torch.isfinite(loss).all():
+                            #     accelerator.print(f"[Rank {accelerator.process_index}] ⚠️ Loss has NaN or Inf. Skipping backward/optimizer step.")
+                            #     optimizer.zero_grad()
+                            #     continue  # skip this batch entirely
+
+                            # accelerator.backward(loss)
+                            # Check for param anomalies BEFORE stepping
+                            # for name, param in unwrapped_model.value_model.named_parameters():
+                            #     if torch.isnan(param).any() or torch.isinf(param).any():
+                            #         accelerator.print(f"❌ {name} has NaN or Inf BEFORE optimizer step!")
+
+                            # grad_norm = torch.norm(
+                            #     torch.stack([
+                            #         p.grad.norm() for p in model.parameters() if p.grad is not None and torch.isfinite(p.grad).all()
+                            #     ])
+                            # )
+                            # accelerator.print(f"[Rank {accelerator.process_index}] Grad norm: {grad_norm:.3f}")
+
+                            # if update%10 == 0:
+                            #     try:
+                            #         print(f"NAN GUARD \n [Rank {accelerator.process_index}] 🚀 Training step {update} - ")
+                            #         fast_nan_guard(loss, "loss", accelerator)
+                            #         fast_nan_guard(rewards, "rewards", accelerator)
+                            #         fast_nan_guard(returns, "returns", accelerator)
+                            #         fast_nan_guard(values, "values", accelerator)
+                            #         fast_nan_guard(advantages, "advantages", accelerator)
+
+                            #         accelerator.backward(loss)
+                            #         accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            #         optimizer.step()
+                            #         optimizer.zero_grad()
+
+                            #     except Exception as e:
+                            #         accelerator.print(f"[Rank {accelerator.process_index}] 🚨 Skipping step due to NaN/Inf.")
+                            #         optimizer.zero_grad()
+                            #         continue  
+
+                            # else:
+                            #     accelerator.backward(loss)
+                            #     optimizer.step()
+                            #     optimizer.zero_grad()
+
+                            accelerator.backward(loss)
+                            optimizer.step()
+                            optimizer.zero_grad()
 
                             # after_policy = get_param_sum(unwrapped_model.policy)
                             after_value = get_param_sum(unwrapped_model.value_model)
@@ -709,6 +781,7 @@ class PPOTrainer(Trainer):
                                 vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
                                     vf_clipfrac
                                 )
+                                vf_clipfrac_hits_ratio[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = value_clipfrac
                                 entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
                                 ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
 
@@ -773,12 +846,15 @@ class PPOTrainer(Trainer):
                 metrics["val/td_error_episode_std"] = episode_td_error_std
                 metrics["val/td_error_training_avg"] = self.accelerator.gather_for_metrics(td_error_stats).mean().item()
                 metrics["val/td_error_training_std"] = self.accelerator.gather_for_metrics(td_error_stats).std().item()
+                metrics["val/td_error_squared_avg"] = self.accelerator.gather_for_metrics(td_errors ** 2).mean().item()
                 metrics["val/target_value_avg"] = self.accelerator.gather_for_metrics(target_value_stats).mean().item()
                 metrics["val/target_value_std"] = self.accelerator.gather_for_metrics(target_value_stats).std().item()
                 metrics["val/pred_value_avg"] = self.accelerator.gather_for_metrics(pred_value_stats).mean().item()
                 metrics["val/pred_value_std"] = self.accelerator.gather_for_metrics(pred_value_stats).std().item()
                 metrics["val/return_avg"] = self.accelerator.gather_for_metrics(return_stats).mean().item()
                 metrics["val/return_std"] = self.accelerator.gather_for_metrics(return_stats).std().item()
+                metrics["val/value_clipfrac_total_hits"] = self.accelerator.gather_for_metrics(vf_clipfrac_hits_ratio).sum().item()
+
                 
                 # Episode-level value and return stats
                 metrics["val/returns_episode_mean"] = episode_returns_mean
