@@ -1,8 +1,11 @@
 import subprocess, os, pathlib
 import time
 
-GAMMA = [0.5, 0.95, 1.0]
-LAM   = [0.5, 0.95, 1.0]
+# GAMMA = [0.5, 0.95, 1.0]
+# LAM   = [0.5, 0.95, 1.0]
+
+GAMMA = [0.95]
+LAM = [0.95]
 
 ACCEL_CFG = "../../accelerate_configs/deepspeed_zero2.yaml"
 BASE_OUT  = "/scratch/cluster/piti/trl/examples/scripts/ppo/aug_18"
@@ -30,9 +33,9 @@ done_pairs = [(0.5, 0.5),
 for g in GAMMA:
     for l in LAM:
         # Skip  the existing models
-        if (g, l) in done_pairs or (g,l) in midi_3_pairs:
-            print(f"Skipping run for gamma={g}, lam={l}")
-            continue
+        # if (g, l) in done_pairs or (g,l) in midi_3_pairs:
+        #     print(f"Skipping run for gamma={g}, lam={l}")
+        #     continue
 
         run_name   = f"tldr-ppco-g{slug(g)}-l{slug(l)}"
         output_dir = f"{BASE_OUT}/{run_name}"
@@ -60,26 +63,7 @@ for g in GAMMA:
             "--push_to_hub", "True",
             "--gamma", str(g),
             "--lam", str(l),
-            "--run_name", run_name,           # if your script supports this arg
-        ]
-
-        # print(f"\n=== Launching {run_name} ===")
-        # pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
-        # with open(log_path, "w") as lf:
-        #     lf.write(f"# CMD: {' '.join(cmd)}\n\n")
-        #     lf.flush()
-        #     # block until the run fully completes
-        #     subprocess.run(cmd, check=True, env=ENV, stdout=lf, stderr=lf)
-        # print(f"✅ Finished {run_name}. Logs: {log_path}")
-        # # optional: remove the output bin file to save space
-        # bin_file = os.path.join(output_dir, "pytorch_model.bin")
-
-        # # Remove only the .bin file if it exists
-        # if os.path.exists(bin_file):
-        #     subprocess.run(["rm", "-f", bin_file], check=True)
-        #     print(f"🗑️  Removed file: {bin_file}")
-        # else:
-        #     print("⚠️  pytorch_model.bin not found.")
+            "--run_name", run_name,          
 
         print(f"\n=== Launching {run_name} ===")
         pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
