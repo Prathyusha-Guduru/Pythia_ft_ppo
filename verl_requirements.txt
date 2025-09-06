@@ -47,9 +47,7 @@ fastapi-cli==0.0.7
 fastrlock==0.8.3
 filelock==3.18.0
 flash_attn
-linux_x86_64.whl#sha256=ffe17686fa1a0f288de9eae7c32af209d32a27b037ef28614f042b377af5b15a
 flashinfer-python
-linux_x86_64.whl#sha256=7b5950853a0769809199f4f252eb271f63700e4f8a51e0da582f0f066b22cd7c
 frozenlist==1.7.0
 fsspec==2025.3.0
 gguf==0.17.1
